@@ -1,0 +1,39 @@
+{
+  "name": "notebook-v1-rebuild",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@tiptap/extension-highlight": "^2.11.7",
+    "@tiptap/extension-link": "^2.11.7",
+    "@tiptap/extension-placeholder": "^2.11.7",
+    "@tiptap/extension-table": "^2.11.7",
+    "@tiptap/extension-table-cell": "^2.11.7",
+    "@tiptap/extension-table-header": "^2.11.7",
+    "@tiptap/extension-table-row": "^2.11.7",
+    "@tiptap/extension-task-item": "^2.11.7",
+    "@tiptap/extension-task-list": "^2.11.7",
+    "@tiptap/extension-typography": "^2.11.7",
+    "@tiptap/extension-underline": "^2.11.7",
+    "@tiptap/react": "^2.11.7",
+    "@tiptap/starter-kit": "^2.11.7",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^4.1.10"
+  }
+}
