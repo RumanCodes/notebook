@@ -470,6 +470,13 @@ button {
   color: var(--muted);
 }
 
+.backup-note {
+  margin: 10px 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .note-list-pane {
   padding: 16px;
   overflow: auto;
@@ -522,6 +529,65 @@ button {
 .note-card.active {
   border-color: var(--border);
   background: var(--surface);
+}
+
+.trash-card {
+  grid-template-columns: 4px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+}
+
+.trash-card:hover {
+  background: var(--surface);
+}
+
+.trash-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.trash-group {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 10px;
+}
+
+.trash-group h2 {
+  margin: 2px 4px 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.trash-row {
+  min-height: 58px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+}
+
+.trash-row-main {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.trash-row-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-row-main span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .note-color {
@@ -1033,10 +1099,31 @@ button {
   box-shadow: var(--shadow);
   font-size: 13px;
   animation: toast-in 180ms var(--ease-out);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .toast.danger {
   background: var(--danger);
+}
+
+.toast-action {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid oklch(1 0 0 / 0.32);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  color: white;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.toast-action:hover {
+  background: oklch(1 0 0 / 0.12);
 }
 
 .sr-status {
@@ -1221,6 +1308,28 @@ button {
 
   .folder-delete {
     opacity: 1;
+  }
+
+  .trash-card {
+    grid-template-columns: 4px minmax(0, 1fr);
+  }
+
+  .trash-card-actions {
+    grid-column: 2;
+  }
+
+  .trash-row {
+    grid-template-columns: 9px minmax(0, 1fr) auto;
+  }
+
+  .trash-row .icon-button {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .trash-row .secondary-button {
+    grid-column: 2 / -1;
+    justify-self: start;
   }
 
   .note-list-pane {

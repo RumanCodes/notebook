@@ -5,6 +5,7 @@ import type {
   Folder,
   LinkRecord,
   Note,
+  RecoveryBackup,
   Settings,
   WorkspaceSnapshot,
 } from '../types';
@@ -12,7 +13,7 @@ import { emptyDoc, extractWikiLinks, jsonToText } from './content';
 import { uid } from './ids';
 
 const DB_NAME = 'notebook_v2_db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const stores = {
   folders: 'folders',
@@ -21,6 +22,7 @@ const stores = {
   links: 'links',
   attachments: 'attachments',
   commandHistory: 'commandHistory',
+  recoveryBackups: 'recoveryBackups',
 } as const;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -36,8 +38,10 @@ function openDb(): Promise<IDBDatabase> {
 
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
+      const upgradeTransaction = request.transaction;
+      const oldVersion = (event as IDBVersionChangeEvent).oldVersion;
 
       if (!db.objectStoreNames.contains(stores.folders)) {
         const folders = db.createObjectStore(stores.folders, { keyPath: 'id' });
@@ -71,6 +75,76 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(stores.commandHistory)) {
         const commandHistory = db.createObjectStore(stores.commandHistory, { keyPath: 'id' });
         commandHistory.createIndex('createdAt', 'createdAt');
+      }
+
+      if (!db.objectStoreNames.contains(stores.recoveryBackups)) {
+        const recoveryBackups = db.createObjectStore(stores.recoveryBackups, { keyPath: 'id' });
+        recoveryBackups.createIndex('createdAt', 'createdAt');
+      }
+
+      if (!upgradeTransaction || oldVersion === 0) return;
+      const migrationTransaction = upgradeTransaction;
+
+      // Keep a copy inside IndexedDB before changing old records. This gives the
+      // app a recovery point if a future schema migration needs to be undone.
+      const foldersRequest = migrationTransaction.objectStore(stores.folders).getAll();
+      const notesRequest = migrationTransaction.objectStore(stores.notes).getAll();
+      const settingsRequest = migrationTransaction.objectStore(stores.settings).get('settings');
+      let folders: Folder[] | undefined;
+      let notes: Note[] | undefined;
+      let settings: Settings | undefined;
+      let backupWritten = false;
+
+      function writeRecoveryBackup() {
+        if (backupWritten || !folders || !notes || !settings) return;
+        backupWritten = true;
+        const backup: RecoveryBackup = {
+          id: uid('recovery'),
+          sourceVersion: oldVersion,
+          createdAt: Date.now(),
+          folders,
+          notes,
+          settings,
+        };
+        migrationTransaction.objectStore(stores.recoveryBackups).put(backup);
+      }
+
+      foldersRequest.onsuccess = () => {
+        folders = foldersRequest.result as Folder[];
+        writeRecoveryBackup();
+      };
+      notesRequest.onsuccess = () => {
+        notes = notesRequest.result as Note[];
+        writeRecoveryBackup();
+      };
+      settingsRequest.onsuccess = () => {
+        settings = (settingsRequest.result as Settings | undefined) ?? {
+          id: 'settings',
+          schemaVersion: oldVersion,
+          lastOpenedNoteId: null,
+          updatedAt: Date.now(),
+        };
+        writeRecoveryBackup();
+      };
+
+      if (oldVersion < 3) {
+        const noteCursor = migrationTransaction.objectStore(stores.notes).openCursor();
+        noteCursor.onsuccess = () => {
+          const cursor = noteCursor.result;
+          if (!cursor) return;
+          const note = cursor.value as Note;
+          if (!note.status) cursor.update({ ...note, status: 'active' });
+          cursor.continue();
+        };
+
+        const settingsCursor = migrationTransaction.objectStore(stores.settings).openCursor();
+        settingsCursor.onsuccess = () => {
+          const cursor = settingsCursor.result;
+          if (!cursor) return;
+          const current = cursor.value as Settings;
+          cursor.update({ ...current, schemaVersion: DB_VERSION });
+          cursor.continue();
+        };
       }
     };
 
@@ -141,7 +215,7 @@ function starterFolder(position = 0): Folder {
   };
 }
 
-export async function loadWorkspace(): Promise<WorkspaceSnapshot> {
+export async function loadWorkspace(): Promise<WorkspaceSnapshot & { recoveryBackup?: RecoveryBackup }> {
   await openDb();
   let settings = (await get<Settings>(stores.settings, 'settings')) ?? defaultSettings();
   let folders = await getAll<Folder>(stores.folders);
@@ -165,10 +239,13 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot> {
     notes = [note];
   }
 
+  const recoveryBackups = await getAll<RecoveryBackup>(stores.recoveryBackups);
+
   return {
     folders: folders.sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
     notes: notes.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt),
     settings,
+    recoveryBackup: recoveryBackups.sort((a, b) => b.createdAt - a.createdAt)[0],
   };
 }
 
@@ -223,14 +300,62 @@ export async function saveFolder(folder: Folder): Promise<Folder> {
   return put(stores.folders, updated);
 }
 
-export async function deleteFolder(folderId: EntityId, notes: Note[]): Promise<void> {
-  await del(stores.folders, folderId);
+export async function trashNote(note: Note): Promise<Note> {
+  return saveNote({
+    ...note,
+    status: 'trashed',
+    trashedAt: Date.now(),
+    trashedReason: 'note',
+  });
+}
 
-  await Promise.all(
+export async function restoreNote(note: Note, folders: Folder[]): Promise<Note> {
+  const folder = note.folderId ? folders.find((item) => item.id === note.folderId) : undefined;
+  return saveNote({
+    ...note,
+    folderId: folder && !folder.deletedAt ? folder.id : null,
+    status: 'active',
+    trashedAt: undefined,
+    trashedReason: undefined,
+  });
+}
+
+export async function trashFolder(folder: Folder, notes: Note[]): Promise<{ folder: Folder; notes: Note[] }> {
+  const deletedAt = Date.now();
+  const updatedFolder = await saveFolder({ ...folder, deletedAt });
+  const updatedNotes = await Promise.all(
     notes
-      .filter((note) => note.folderId === folderId)
-      .map((note) => saveNote({ ...note, folderId: null })),
+      .filter((note) => note.folderId === folder.id && note.status !== 'trashed')
+      .map((note) => saveNote({
+        ...note,
+        status: 'trashed',
+        trashedAt: deletedAt,
+        trashedReason: 'folder',
+      })),
   );
+
+  return { folder: updatedFolder, notes: updatedNotes };
+}
+
+export async function restoreFolder(folder: Folder, notes: Note[]): Promise<{ folder: Folder; notes: Note[] }> {
+  const updatedFolder = await saveFolder({ ...folder, deletedAt: undefined });
+  const updatedNotes = await Promise.all(
+    notes
+      .filter((note) => note.folderId === folder.id && note.trashedReason === 'folder')
+      .map((note) => saveNote({
+        ...note,
+        status: 'active',
+        trashedAt: undefined,
+        trashedReason: undefined,
+      })),
+  );
+
+  return { folder: updatedFolder, notes: updatedNotes };
+}
+
+export async function deleteFolderPermanently(folderId: EntityId, notes: Note[]): Promise<void> {
+  await del(stores.folders, folderId);
+  await Promise.all(notes.filter((note) => note.folderId === folderId).map((note) => deleteNote(note.id)));
 }
 
 export async function saveNote(note: Note): Promise<Note> {
@@ -250,6 +375,11 @@ export async function saveNote(note: Note): Promise<Note> {
 export async function deleteNote(noteId: EntityId): Promise<void> {
   await del(stores.notes, noteId);
   await deleteLinksForNote(noteId);
+}
+
+export async function getLatestRecoveryBackup(): Promise<RecoveryBackup | undefined> {
+  const backups = await getAll<RecoveryBackup>(stores.recoveryBackups);
+  return backups.sort((a, b) => b.createdAt - a.createdAt)[0];
 }
 
 export async function saveSettings(settings: Settings): Promise<Settings> {

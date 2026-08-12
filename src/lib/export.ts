@@ -4,7 +4,7 @@ import { noteToMarkdown } from './content';
 export function createBackup(folders: Folder[], notes: Note[], settings: Settings): NotebookBackupV2 {
   return {
     appName: 'Notebook',
-    schemaVersion: 2,
+    schemaVersion: 3,
     exportedAt: new Date().toISOString(),
     folders,
     notes,

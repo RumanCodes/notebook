@@ -81,7 +81,7 @@ export function migrateLegacyV1(data: LegacyV1Backup): WorkspaceSnapshot {
 
 function isV2Backup(value: unknown): value is NotebookBackupV2 {
   const backup = value as NotebookBackupV2;
-  return backup?.appName === 'Notebook' && backup.schemaVersion === 2 && Array.isArray(backup.folders) && Array.isArray(backup.notes);
+  return backup?.appName === 'Notebook' && (backup.schemaVersion === 2 || backup.schemaVersion === 3) && Array.isArray(backup.folders) && Array.isArray(backup.notes);
 }
 
 function isLegacyV1Backup(value: unknown): value is LegacyV1Backup {
@@ -110,7 +110,7 @@ function normalizeNote(note: Note): Note {
     tags: Array.isArray(note.tags) ? note.tags.map(String) : [],
     favorite: Boolean(note.favorite),
     pinned: Boolean(note.pinned),
-    status: note.status === 'archived' || note.status === 'draft' ? note.status : 'active',
+    status: note.status === 'archived' || note.status === 'draft' || note.status === 'trashed' ? note.status : 'active',
     color: colors.has(note.color) ? note.color : 'slate',
     position: Number.isFinite(note.position) ? note.position : 0,
     createdAt: Number(note.createdAt || Date.now()),

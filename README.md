@@ -14,13 +14,16 @@ npm run deploy
 
 ## Data
 
-Notebook stores V2 data locally in IndexedDB with stores for notes, folders, settings, links, attachments metadata, and command history. The import flow accepts the existing V1 JSON backup shape from `notebook-app.html` and migrates it into the V2 schema.
+Notebook stores data locally in IndexedDB with stores for notes, folders, settings, links, attachment metadata, command history, and migration recovery copies. The current database version is 3. Existing V2 data is upgraded in place, with an internal recovery copy created before records are migrated. The import flow accepts the existing V1 JSON backup shape from `notebook-app.html` and earlier Notebook JSON backups.
+
+Deleting a note or folder first moves it to Trash. Folder deletion keeps its notes together. Trash supports restore, Undo immediately after deletion, and permanent deletion behind an explicit confirmation. Permanent deletion is the only destructive delete action in the normal interface.
 
 ## Exports
 
 - JSON backup for full workspace recovery.
 - Markdown bundle for portable archive.
 - Single-note Markdown export from the editor.
+- Recovery-copy export after a database upgrade.
 
 ## Cloudflare Workers
 

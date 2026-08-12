@@ -50,4 +50,33 @@ describe('backup import', () => {
   it('rejects unknown files', () => {
     expect(() => parseBackup('{"hello":true}')).toThrow(/Notebook backup/);
   });
+
+  it('preserves Trash records from a current backup', () => {
+    const snapshot = parseBackup(JSON.stringify({
+      appName: 'Notebook',
+      schemaVersion: 3,
+      folders: [{ id: 'folder-1', name: 'Archive', color: 'slate', position: 0, createdAt: 1, updatedAt: 1, deletedAt: 20 }],
+      notes: [{
+        id: 'note-1',
+        folderId: 'folder-1',
+        title: 'Recover me',
+        content: { type: 'doc', content: [{ type: 'paragraph' }] },
+        text: '',
+        tags: [],
+        favorite: false,
+        pinned: false,
+        status: 'trashed',
+        trashedAt: 20,
+        trashedReason: 'folder',
+        color: 'slate',
+        position: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      settings: { id: 'settings', schemaVersion: 3, lastOpenedNoteId: null, updatedAt: 1 },
+    }));
+
+    expect(snapshot.folders[0].deletedAt).toBe(20);
+    expect(snapshot.notes[0]).toMatchObject({ status: 'trashed', trashedReason: 'folder' });
+  });
 });

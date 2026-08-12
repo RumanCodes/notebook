@@ -9,7 +9,7 @@ export type ColorName =
   | 'rose'
   | 'green';
 
-export type NoteStatus = 'draft' | 'active' | 'archived';
+export type NoteStatus = 'draft' | 'active' | 'archived' | 'trashed';
 
 export interface Folder {
   id: EntityId;
@@ -18,7 +18,10 @@ export interface Folder {
   position: number;
   createdAt: number;
   updatedAt: number;
+  deletedAt?: number;
 }
+
+export type TrashReason = 'note' | 'folder';
 
 export interface Note {
   id: EntityId;
@@ -34,6 +37,8 @@ export interface Note {
   position: number;
   createdAt: number;
   updatedAt: number;
+  trashedAt?: number;
+  trashedReason?: TrashReason;
 }
 
 export interface Settings {
@@ -93,11 +98,17 @@ export interface LegacyV1Backup {
 
 export interface NotebookBackupV2 {
   appName: 'Notebook';
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   exportedAt: string;
   folders: Folder[];
   notes: Note[];
   settings: Settings;
+}
+
+export interface RecoveryBackup extends WorkspaceSnapshot {
+  id: EntityId;
+  sourceVersion: number;
+  createdAt: number;
 }
 
 export interface SearchHit {

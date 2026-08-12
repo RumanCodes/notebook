@@ -89,6 +89,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
   useEffect(() => {
     if (!editor) return;
     if (currentNoteId.current !== note.id) {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
       currentNoteId.current = note.id;
       editor.commands.setContent(note.content as JSONContent);
       setTitle(note.title);
@@ -151,7 +152,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
           {detailsOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
           Details
         </button>
-        <button className="icon-button danger" type="button" title="Delete note" onClick={onDelete}>
+        <button className="icon-button danger" type="button" title="Move note to Trash" aria-label="Move note to Trash" onClick={onDelete}>
           <Trash2 size={16} />
         </button>
       </div>
