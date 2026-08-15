@@ -33,6 +33,7 @@ import {
   UnderlineIcon,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { saveDraft } from '../lib/repository';
 import type { Folder, Note } from '../types';
 
 interface EditorPaneProps {
@@ -40,8 +41,8 @@ interface EditorPaneProps {
   note: Note;
   saveState: 'idle' | 'saving' | 'saved' | 'error';
   onChange: (note: Note) => void;
-  onPatch: (patch: Partial<Note>) => void;
-  onDelete: () => void;
+  onPatch: (patch: Partial<Note>, baseNote: Note) => void;
+  onDelete: (note: Note) => void;
   onExport: () => void;
   detailsOpen: boolean;
   onToggleDetails: () => void;
@@ -51,6 +52,13 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
   const [title, setTitle] = useState(note.title);
   const saveTimer = useRef<number | null>(null);
   const currentNoteId = useRef(note.id);
+  const draftRef = useRef(note);
+  const pendingRef = useRef(false);
+  const onChangeRef = useRef(onChange);
+
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
 
   const editor = useEditor({
     extensions: [
@@ -86,36 +94,82 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
     onUpdate: ({ editor }) => scheduleSave({ content: editor.getJSON(), text: editor.getText() }),
   });
 
+  function flushPendingSave() {
+    if (saveTimer.current !== null) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    if (!pendingRef.current) return;
+
+    pendingRef.current = false;
+    onChangeRef.current(draftRef.current);
+  }
+
   useEffect(() => {
     if (!editor) return;
     if (currentNoteId.current !== note.id) {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      flushPendingSave();
       currentNoteId.current = note.id;
-      editor.commands.setContent(note.content as JSONContent);
+      draftRef.current = note;
+      editor.commands.setContent(note.content as JSONContent, false);
       setTitle(note.title);
       return;
     }
-    setTitle(note.title);
+    if (!pendingRef.current) {
+      draftRef.current = note;
+      setTitle(note.title);
+    }
   }, [editor, note]);
 
   useEffect(() => {
+    function persistBeforePageIsHidden() {
+      flushPendingSave();
+    }
+
+    window.addEventListener('pagehide', persistBeforePageIsHidden);
+    document.addEventListener('visibilitychange', persistBeforePageIsHidden);
+
     return () => {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      window.removeEventListener('pagehide', persistBeforePageIsHidden);
+      document.removeEventListener('visibilitychange', persistBeforePageIsHidden);
+      flushPendingSave();
     };
   }, []);
 
   const folder = useMemo(() => folders.find((item) => item.id === note.folderId), [folders, note.folderId]);
 
   function scheduleSave(patch: Partial<Note>) {
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    pendingRef.current = true;
+    saveDraft(next);
     saveTimer.current = window.setTimeout(() => {
-      onChange({ ...note, title, ...patch });
+      saveTimer.current = null;
+      pendingRef.current = false;
+      onChangeRef.current(draftRef.current);
     }, 450);
   }
 
   function updateTitle(value: string) {
     setTitle(value);
     scheduleSave({ title: value });
+  }
+
+  function applyPatch(patch: Partial<Note>) {
+    if (saveTimer.current !== null) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    pendingRef.current = false;
+    draftRef.current = { ...draftRef.current, ...patch };
+    saveDraft(draftRef.current);
+    onPatch(patch, draftRef.current);
+  }
+
+  function deleteCurrentNote() {
+    flushPendingSave();
+    onDelete(draftRef.current);
   }
 
   function setLink() {
@@ -152,7 +206,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
           {detailsOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
           Details
         </button>
-        <button className="icon-button danger" type="button" title="Move note to Trash" aria-label="Move note to Trash" onClick={onDelete}>
+        <button className="icon-button danger" type="button" title="Move note to Trash" aria-label="Move note to Trash" onClick={deleteCurrentNote}>
           <Trash2 size={16} />
         </button>
       </div>
@@ -184,7 +238,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
       <div className="editor-footer">
         <label>
           Folder
-          <select value={note.folderId ?? 'unfiled'} onChange={(event) => onPatch({ folderId: event.target.value === 'unfiled' ? null : event.target.value })}>
+          <select value={note.folderId ?? 'unfiled'} onChange={(event) => applyPatch({ folderId: event.target.value === 'unfiled' ? null : event.target.value })}>
             <option value="unfiled">Unfiled</option>
             {folders.map((item) => (
               <option value={item.id} key={item.id}>
@@ -193,10 +247,10 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
             ))}
           </select>
         </label>
-        <button className={`toggle-button ${note.favorite ? 'active' : ''}`} type="button" onClick={() => onPatch({ favorite: !note.favorite })}>
+        <button className={`toggle-button ${note.favorite ? 'active' : ''}`} type="button" onClick={() => applyPatch({ favorite: !note.favorite })}>
           Favorite
         </button>
-        <button className={`toggle-button ${note.pinned ? 'active' : ''}`} type="button" onClick={() => onPatch({ pinned: !note.pinned })}>
+        <button className={`toggle-button ${note.pinned ? 'active' : ''}`} type="button" onClick={() => applyPatch({ pinned: !note.pinned })}>
           Pinned
         </button>
       </div>

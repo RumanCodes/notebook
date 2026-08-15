@@ -3,6 +3,7 @@ import type {
   CommandHistory,
   EntityId,
   Folder,
+  LegacyV1Backup,
   LinkRecord,
   Note,
   RecoveryBackup,
@@ -10,10 +11,13 @@ import type {
   WorkspaceSnapshot,
 } from '../types';
 import { emptyDoc, extractWikiLinks, jsonToText } from './content';
+import { migrateLegacyV1 } from './import';
 import { uid } from './ids';
 
 const DB_NAME = 'notebook_v2_db';
 const DB_VERSION = 3;
+const LEGACY_DB_NAME = 'notebook_app_db';
+const DRAFT_JOURNAL_KEY = 'notebook_v2_pending_drafts';
 
 const stores = {
   folders: 'folders',
@@ -26,6 +30,67 @@ const stores = {
 } as const;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
+const noteSaveQueues = new Map<EntityId, Promise<Note>>();
+
+type DraftJournalEntry = {
+  note: Note;
+  capturedAt: number;
+};
+
+function readDraftJournal(): DraftJournalEntry[] {
+  try {
+    const raw = localStorage.getItem(DRAFT_JOURNAL_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter((entry): entry is DraftJournalEntry => {
+      const candidate = entry as DraftJournalEntry;
+      return Boolean(candidate?.note?.id) && Number.isFinite(candidate.capturedAt);
+    });
+  } catch {
+    // Storage can be disabled or unavailable in private browsing contexts.
+    return [];
+  }
+}
+
+function writeDraftJournal(entries: DraftJournalEntry[]): void {
+  try {
+    if (entries.length === 0) {
+      localStorage.removeItem(DRAFT_JOURNAL_KEY);
+      return;
+    }
+    localStorage.setItem(DRAFT_JOURNAL_KEY, JSON.stringify(entries));
+  } catch {
+    // IndexedDB remains the primary store; the journal is only a crash/reload safety net.
+  }
+}
+
+/**
+ * Write the latest editor state synchronously before the debounced IndexedDB
+ * write. This closes the small but important window where a reload could
+ * destroy text that was still waiting on the editor timer.
+ */
+export function saveDraft(note: Note): void {
+  const entries = readDraftJournal().filter((entry) => entry.note.id !== note.id);
+  entries.push({
+    note: { ...note, updatedAt: Date.now() },
+    capturedAt: Date.now(),
+  });
+  writeDraftJournal(entries.slice(-50));
+}
+
+function sameNotePayload(left: Note, right: Note): boolean {
+  const { updatedAt: _leftUpdatedAt, ...leftPayload } = left;
+  const { updatedAt: _rightUpdatedAt, ...rightPayload } = right;
+  return JSON.stringify(leftPayload) === JSON.stringify(rightPayload);
+}
+
+function clearDraftIfMatches(note: Note): void {
+  const entries = readDraftJournal();
+  const remaining = entries.filter((entry) => entry.note.id !== note.id || !sameNotePayload(entry.note, note));
+  if (remaining.length !== entries.length) writeDraftJournal(remaining);
+}
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
@@ -148,7 +213,12 @@ function openDb(): Promise<IDBDatabase> {
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      if (typeof navigator !== 'undefined' && navigator.storage?.persist) {
+        void navigator.storage.persist().catch(() => undefined);
+      }
+      resolve(request.result);
+    };
     request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB.'));
     request.onblocked = () => reject(new Error('Notebook is open in another tab and blocked the database upgrade.'));
   });
@@ -221,6 +291,18 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot & { recoveryBac
   let folders = await getAll<Folder>(stores.folders);
   let notes = await getAll<Note>(stores.notes);
 
+  notes = await recoverPendingDrafts(notes, folders);
+
+  if (folders.length === 0 && notes.length === 0) {
+    const legacyWorkspace = await readLegacyWorkspace();
+    if (legacyWorkspace) {
+      await replaceWorkspace(legacyWorkspace);
+      folders = legacyWorkspace.folders;
+      notes = legacyWorkspace.notes;
+      settings = legacyWorkspace.settings;
+    }
+  }
+
   if (folders.length === 0 && notes.length === 0) {
     const folder = starterFolder();
     const note = createNote(folder.id, {
@@ -247,6 +329,69 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot & { recoveryBac
     settings,
     recoveryBackup: recoveryBackups.sort((a, b) => b.createdAt - a.createdAt)[0],
   };
+}
+
+async function readLegacyWorkspace(): Promise<WorkspaceSnapshot | undefined> {
+  if (!('indexedDB' in globalThis)) return undefined;
+
+  try {
+    // Avoid opening/creating the legacy database when it never existed. This
+    // API is supported by current Chromium, Firefox, and Safari releases.
+    if (indexedDB.databases) {
+      const databases = await indexedDB.databases();
+      if (!databases.some((database) => database.name === LEGACY_DB_NAME)) return undefined;
+    }
+
+    const legacy = await readLegacyStores();
+    if (legacy.folders.length === 0 && legacy.notes.length === 0) return undefined;
+
+    return migrateLegacyV1({
+      appName: 'Notebook',
+      version: 1,
+      folders: legacy.folders,
+      notes: legacy.notes,
+    } as LegacyV1Backup);
+  } catch {
+    // Legacy recovery is best effort; a normal empty workspace can still open.
+    return undefined;
+  }
+}
+
+function readLegacyStores(): Promise<{ folders: Array<Record<string, unknown>>; notes: Array<Record<string, unknown>> }> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LEGACY_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      // If databases() was unavailable, do not leave a newly created empty DB
+      // behind. The caller will simply continue with a fresh workspace.
+      request.transaction?.abort();
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('folders') || !db.objectStoreNames.contains('notes')) {
+        db.close();
+        resolve({ folders: [], notes: [] });
+        return;
+      }
+
+      const transaction = db.transaction(['folders', 'notes'], 'readonly');
+      const foldersRequest = transaction.objectStore('folders').getAll();
+      const notesRequest = transaction.objectStore('notes').getAll();
+      let folders: Array<Record<string, unknown>> = [];
+      let notes: Array<Record<string, unknown>> = [];
+
+      foldersRequest.onsuccess = () => { folders = foldersRequest.result as Array<Record<string, unknown>>; };
+      notesRequest.onsuccess = () => { notes = notesRequest.result as Array<Record<string, unknown>>; };
+      transaction.oncomplete = () => {
+        db.close();
+        resolve({ folders, notes });
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error ?? new Error('Could not read the legacy Notebook database.'));
+      };
+    };
+    request.onerror = () => reject(request.error ?? new Error('Could not open the legacy Notebook database.'));
+  });
 }
 
 export function createFolder(name = 'Untitled folder', position = 0): Folder {
@@ -359,6 +504,18 @@ export async function deleteFolderPermanently(folderId: EntityId, notes: Note[])
 }
 
 export async function saveNote(note: Note): Promise<Note> {
+  const previous = noteSaveQueues.get(note.id) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(() => saveNoteNow(note));
+  noteSaveQueues.set(note.id, current);
+
+  try {
+    return await current;
+  } finally {
+    if (noteSaveQueues.get(note.id) === current) noteSaveQueues.delete(note.id);
+  }
+}
+
+async function saveNoteNow(note: Note): Promise<Note> {
   const content = note.content ?? emptyDoc;
   const updated = {
     ...note,
@@ -368,8 +525,34 @@ export async function saveNote(note: Note): Promise<Note> {
   };
 
   await put(stores.notes, updated);
+  clearDraftIfMatches(note);
   await rebuildLinksForNote(updated);
   return updated;
+}
+
+async function recoverPendingDrafts(notes: Note[], folders: Folder[]): Promise<Note[]> {
+  const entries = readDraftJournal();
+  if (entries.length === 0) return notes;
+
+  const recovered = [...notes];
+  for (const entry of entries) {
+    const persisted = recovered.find((note) => note.id === entry.note.id);
+    if (persisted && entry.capturedAt <= persisted.updatedAt) {
+      clearDraftIfMatches(entry.note);
+      continue;
+    }
+
+    const folderId = entry.note.folderId && folders.some((folder) => folder.id === entry.note.folderId)
+      ? entry.note.folderId
+      : null;
+    const draft = { ...entry.note, folderId, updatedAt: entry.capturedAt };
+    const saved = await saveNote(draft);
+    const index = recovered.findIndex((note) => note.id === saved.id);
+    if (index === -1) recovered.push(saved);
+    else recovered[index] = saved;
+  }
+
+  return recovered;
 }
 
 export async function deleteNote(noteId: EntityId): Promise<void> {

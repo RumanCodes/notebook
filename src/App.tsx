@@ -83,6 +83,7 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const importInputRef = useRef<HTMLInputElement>(null);
   const booted = useRef(false);
+  const saveRequest = useRef(0);
 
   useEffect(() => {
     if (booted.current) return;
@@ -200,14 +201,16 @@ export function App() {
   }
 
   async function handleSaveNote(note: Note) {
+    const requestId = ++saveRequest.current;
     setSaveState('saving');
+    setNotes((current) => current.map((item) => (item.id === note.id ? note : item)));
     try {
       const saved = await saveNote(note);
       setNotes((current) => current.map((item) => (item.id === saved.id ? saved : item)));
-      setSaveState('saved');
+      if (requestId === saveRequest.current) setSaveState('saved');
       await persistLastOpened(saved.id);
     } catch {
-      setSaveState('error');
+      if (requestId === saveRequest.current) setSaveState('error');
       showToast('The note could not be saved.', 'danger');
     }
   }
@@ -224,8 +227,8 @@ export function App() {
     setSidebarOpen(false);
   }
 
-  async function handleDeleteNote(noteId: EntityId) {
-    const note = notes.find((item) => item.id === noteId);
+  async function handleDeleteNote(noteId: EntityId, noteOverride?: Note) {
+    const note = noteOverride ?? notes.find((item) => item.id === noteId);
     if (!note) return;
     const trashed = await trashNote(note);
     setNotes((current) => current.map((item) => (item.id === trashed.id ? trashed : item)));
@@ -288,9 +291,9 @@ export function App() {
     showToast('Folder permanently deleted', 'danger');
   }
 
-  async function patchSelectedNote(patch: Partial<Note>) {
-    if (!selectedNote) return;
-    await handleSaveNote({ ...selectedNote, ...patch });
+  async function patchSelectedNote(patch: Partial<Note>, baseNote = selectedNote) {
+    if (!baseNote) return;
+    await handleSaveNote({ ...baseNote, ...patch });
   }
 
   function exportJson() {
@@ -605,9 +608,9 @@ export function App() {
               note={selectedNote}
               saveState={saveState}
               onChange={(note) => void handleSaveNote(note)}
-              onDelete={() => void handleDeleteNote(selectedNote.id)}
+              onDelete={(note) => void handleDeleteNote(note.id, note)}
               onExport={exportCurrentNote}
-              onPatch={(patch) => void patchSelectedNote(patch)}
+              onPatch={(patch, baseNote) => void patchSelectedNote(patch, baseNote)}
               detailsOpen={inspectorOpen}
               onToggleDetails={() => setInspectorOpen((value) => !value)}
             />
