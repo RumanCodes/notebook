@@ -32,7 +32,7 @@ export function Inspector({ folders, notes, note, onOpenNote, onPatch }: Inspect
         </h2>
         <label className="field">
           Tags
-          <input value={note.tags.join(', ')} onChange={(event) => updateTags(event.target.value)} placeholder="research, ideas" />
+          <input value={note.tags.join(', ')} maxLength={5000} onChange={(event) => updateTags(event.target.value)} placeholder="Add tags, separated by commas" />
         </label>
         <label className="field">
           Color
@@ -71,7 +71,7 @@ export function Inspector({ folders, notes, note, onOpenNote, onPatch }: Inspect
             ))}
           </div>
         ) : (
-          <p className="muted">No notes link here yet. Use [[{note.title || 'this title'}]] in another note.</p>
+          <p className="muted">No backlinks yet. Link to this note with [[{note.title || 'this title'}]] from another note.</p>
         )}
       </section>
 
@@ -90,7 +90,7 @@ export function Inspector({ folders, notes, note, onOpenNote, onPatch }: Inspect
             ))}
           </div>
         ) : (
-          <p className="muted">Shared tags and wiki links will appear here.</p>
+          <p className="muted">Notes with shared tags or links will appear here.</p>
         )}
       </section>
 

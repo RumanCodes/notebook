@@ -197,7 +197,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
         </div>
         <div className={`save-indicator ${saveState}`}>
           <Save size={14} />
-          <span>{saveState === 'saving' ? 'Saving' : saveState === 'error' ? 'Save failed' : 'Saved'}</span>
+          <span>{saveState === 'saving' ? 'Saving locally' : saveState === 'error' ? 'Save failed' : 'Saved locally'}</span>
         </div>
         <button className="icon-button" type="button" title="Export note as Markdown" onClick={onExport}>
           <Download size={16} />
@@ -211,7 +211,7 @@ export function EditorPane({ folders, note, saveState, onChange, onPatch, onDele
         </button>
       </div>
 
-      <input className="title-input" value={title} onChange={(event) => updateTitle(event.target.value)} placeholder="Untitled note" aria-label="Note title" />
+      <input className="title-input" value={title} maxLength={500} onChange={(event) => updateTitle(event.target.value)} placeholder="Untitled note" aria-label="Note title" />
 
       <div className="editor-toolbar" role="toolbar" aria-label="Formatting">
         <ToolbarButton label="Paragraph" active={editor?.isActive('paragraph')} onClick={() => editor?.chain().focus().setParagraph().run()} icon={<Pilcrow size={16} />} />

@@ -306,9 +306,9 @@ export async function loadWorkspace(): Promise<WorkspaceSnapshot & { recoveryBac
   if (folders.length === 0 && notes.length === 0) {
     const folder = starterFolder();
     const note = createNote(folder.id, {
-      title: 'Notebook starts here',
-      text: 'Use Cmd K for commands. Add [[links]] between notes. Export JSON or Markdown any time.',
-      tags: ['welcome'],
+      title: 'Getting started',
+      text: 'Use the command palette to create notes and folders. Add [[links]] to connect ideas, and export a backup whenever you need a portable copy.',
+      tags: ['getting-started'],
     });
 
     await put(stores.folders, folder);
@@ -575,6 +575,11 @@ export async function replaceWorkspace(snapshot: WorkspaceSnapshot): Promise<voi
   await Promise.all(snapshot.notes.map((note) => put(stores.notes, note)));
   await put(stores.settings, snapshot.settings);
   await rebuildLinks(snapshot.notes);
+}
+
+export async function clearLocalWorkspace(): Promise<void> {
+  await Promise.all(Object.values(stores).map(clear));
+  writeDraftJournal([]);
 }
 
 export async function recordCommand(command: string): Promise<void> {

@@ -1,31 +1,49 @@
 import {
   Archive,
   ArchiveRestore,
+  Cloud,
+  CloudOff,
   Command,
   Download,
   FileDown,
   FilePlus2,
   FolderPlus,
   Import,
+  LogOut,
   Menu,
   Pencil,
   Pin,
   Plus,
   RotateCcw,
+  RefreshCw,
   Search,
   ShieldCheck,
   Star,
   Tags,
   Trash2,
+  UserRoundX,
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CommandPalette } from './components/CommandPalette';
 import { EditorPane } from './components/EditorPane';
 import { Inspector } from './components/Inspector';
+import {
+  CloudApiError,
+  GOOGLE_CLIENT_ID,
+  deleteCloudAccount,
+  getSession,
+  isCloudConfigured,
+  loadCloudWorkspace,
+  loginWithGoogle,
+  logoutFromCloud,
+  saveCloudWorkspace,
+  type CloudUser,
+} from './lib/cloud';
 import { createBackup, downloadText, exportNoteMarkdown, exportWorkspaceMarkdown, safeFilename } from './lib/export';
 import { parseBackup } from './lib/import';
 import {
+  clearLocalWorkspace,
   createFolder,
   createNote,
   deleteFolderPermanently,
@@ -42,10 +60,110 @@ import {
   trashNote,
 } from './lib/repository';
 import { rankNotes } from './lib/search';
-import type { EntityId, Folder, Note, RecoveryBackup, Settings } from './types';
+import type { EntityId, Folder, Note, RecoveryBackup, Settings, WorkspaceSnapshot } from './types';
 
 type ViewId = EntityId | 'all' | 'favorites' | 'unfiled' | 'trash';
 type ToastState = { id: string; tone: 'info' | 'danger'; message: string; action?: { label: string; run: () => Promise<void> } };
+type AuthState = { status: 'checking' | 'signed-out' | 'signed-in' | 'offline'; user: CloudUser | null };
+type SyncState = 'idle' | 'syncing' | 'synced' | 'error' | 'conflict' | 'offline';
+type PendingCloudWorkspace = { workspace: WorkspaceSnapshot; revision: number | null; updatedAt: number | null };
+
+let googleScriptPromise: Promise<void> | null = null;
+
+function loadGoogleIdentityScript(): Promise<void> {
+  if (window.google?.accounts?.id) return Promise.resolve();
+  if (googleScriptPromise) return googleScriptPromise;
+
+  googleScriptPromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>('script[src="https://accounts.google.com/gsi/client"]');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(), { once: true });
+      existing.addEventListener('error', () => reject(new Error('Google sign-in is unavailable. Check your connection and try again.')), { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Google sign-in is unavailable. Check your connection and try again.'));
+    document.head.appendChild(script);
+  });
+
+  return googleScriptPromise;
+}
+
+function GoogleSignInButton({ onCredential, disabled }: { onCredential: (credential: string) => void; disabled?: boolean }) {
+  const buttonRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!buttonRef.current || disabled || !GOOGLE_CLIENT_ID) return;
+    buttonRef.current.innerHTML = '';
+
+    loadGoogleIdentityScript()
+      .then(() => {
+        if (!buttonRef.current || !window.google) return;
+        window.google.accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID,
+          callback: (response) => onCredential(response.credential),
+          auto_select: false,
+        });
+        window.google.accounts.id.renderButton(buttonRef.current, {
+          theme: 'outline',
+          size: 'large',
+          type: 'standard',
+          shape: 'rectangular',
+          text: 'signin_with',
+          width: 280,
+        });
+      })
+      .catch(() => undefined);
+  }, [disabled, onCredential]);
+
+  return <div ref={buttonRef} className="google-signin-slot" />;
+}
+
+function syncText(state: SyncState): string {
+  if (state === 'syncing') return 'Saving';
+  if (state === 'synced') return 'Saved';
+  if (state === 'conflict') return 'Sync conflict';
+  if (state === 'offline') return 'Offline';
+  if (state === 'error') return 'Sync unavailable';
+  return 'Ready';
+}
+
+function AuthScreen({ busy, error, onCredential }: { busy: boolean; error: string | null; onCredential: (credential: string) => void }) {
+  return (
+    <div className="auth-shell">
+      <section className="auth-panel" aria-labelledby="auth-title">
+        <span className="brand-mark">N</span>
+        <h1 id="auth-title">Notebook</h1>
+        <p>Notebook is a private, local-first notes app for writing, organizing, searching, and connecting ideas. Sign in to keep your workspace synced and available on every device.</p>
+        {isCloudConfigured() ? (
+          <GoogleSignInButton onCredential={onCredential} disabled={busy} />
+        ) : (
+          <div className="auth-error">Google sign-in is not configured. Add VITE_GOOGLE_CLIENT_ID before building.</div>
+        )}
+        {busy && <span className="auth-status">Opening your workspace</span>}
+        {error && <div className="auth-error">{error}</div>}
+      </section>
+    </div>
+  );
+}
+
+function WorkspaceLoadingScreen() {
+  return (
+    <div className="auth-shell">
+      <section className="auth-panel" aria-labelledby="workspace-loading-title" aria-busy="true">
+        <span className="brand-mark">N</span>
+        <h1 id="workspace-loading-title">Notebook</h1>
+        <p>Loading your workspace</p>
+        <span className="auth-status" role="status">Checking your sign-in</span>
+      </section>
+    </div>
+  );
+}
 
 function timeAgo(timestamp: number): string {
   const diff = Date.now() - timestamp;
@@ -59,6 +177,30 @@ function timeAgo(timestamp: number): string {
 
 function folderName(folders: Folder[], id: EntityId | null): string {
   return folders.find((folder) => folder.id === id)?.name ?? 'Unfiled';
+}
+
+function countLabel(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function workspaceFromLocal(local: WorkspaceSnapshot): WorkspaceSnapshot {
+  return {
+    folders: local.folders,
+    notes: local.notes,
+    settings: local.settings,
+  };
+}
+
+function isFreshWorkspace(snapshot: WorkspaceSnapshot): boolean {
+  return snapshot.folders.length === 1
+    && snapshot.folders[0]?.name === 'Inbox'
+    && snapshot.notes.length === 1
+    && snapshot.notes[0]?.title === 'Getting started'
+    && snapshot.notes[0]?.tags.includes('getting-started');
+}
+
+function sameWorkspace(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function uniqueTags(notes: Note[]): string[] {
@@ -78,26 +220,87 @@ export function App() {
   const [editingFolderId, setEditingFolderId] = useState<EntityId | null>(null);
   const [editingFolderName, setEditingFolderName] = useState('');
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [syncState, setSyncState] = useState<SyncState>('idle');
+  const [auth, setAuth] = useState<AuthState>({ status: 'checking', user: null });
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [offlineMessage, setOfflineMessage] = useState<string | null>(null);
+  const [cloudUpdatedAt, setCloudUpdatedAt] = useState<number | null>(null);
+  const [pendingCloud, setPendingCloud] = useState<PendingCloudWorkspace | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [recoveryBackup, setRecoveryBackup] = useState<RecoveryBackup | undefined>();
   const [loading, setLoading] = useState(true);
   const importInputRef = useRef<HTMLInputElement>(null);
   const booted = useRef(false);
   const saveRequest = useRef(0);
+  const cloudRevisionRef = useRef<number | null>(null);
+  const cloudSyncEnabled = useRef(false);
+  const cloudSyncTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
-    loadWorkspace()
-      .then((snapshot) => {
-        setFolders(snapshot.folders);
-        setNotes(snapshot.notes);
-        setSettings(snapshot.settings);
-        setRecoveryBackup(snapshot.recoveryBackup);
-        setSelectedNoteId(snapshot.settings.lastOpenedNoteId ?? snapshot.notes[0]?.id ?? null);
+
+    if (!isCloudConfigured()) {
+      setAuth({ status: 'signed-out', user: null });
+      setLoading(false);
+      return;
+    }
+
+    getSession()
+      .then(async (session) => {
+        if (!session.authenticated || !session.user) {
+          setAuth({ status: 'signed-out', user: null });
+          setLoading(false);
+          return;
+        }
+
+        setAuth({ status: 'signed-in', user: session.user });
+        await openSignedInWorkspace();
       })
-      .catch((error) => showToast(error.message || 'Notebook could not open local storage.', 'danger'))
-      .finally(() => setLoading(false));
+      .catch(async (error) => {
+        try {
+          await openOfflineWorkspace("Cloud sync is unavailable. Your local notes remain available on this device.");
+          setAuth({ status: 'offline', user: null });
+        } catch {
+          setAuth({ status: 'signed-out', user: null });
+          setAuthError(error instanceof Error ? error.message : "We couldn't open your workspace. Check your connection and try again.");
+          setLoading(false);
+        }
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!settings || auth.status !== 'signed-in' || !cloudSyncEnabled.current) return;
+    if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
+
+    const snapshot: WorkspaceSnapshot = { folders, notes, settings };
+    setSyncState('syncing');
+    cloudSyncTimer.current = window.setTimeout(() => {
+      void saveCloudWorkspace(snapshot, cloudRevisionRef.current)
+        .then((result) => {
+          cloudRevisionRef.current = result.revision;
+          setCloudUpdatedAt(result.updatedAt);
+          setSyncState('synced');
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : "We couldn't sync your workspace.";
+          if (error instanceof CloudApiError && error.status === 409) {
+            void enterSyncConflict();
+            return;
+          }
+          setOfflineMessage("Your local changes are safe on this device. Retry sync when the connection is available.");
+          setSyncState(error instanceof CloudApiError ? 'error' : 'offline');
+          showToast(message, 'danger');
+        });
+    }, 900);
+
+    return () => {
+      if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
+    };
+  }, [auth.status, folders, notes, settings]);
+
+  useEffect(() => () => {
+    if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
   }, []);
 
   useEffect(() => {
@@ -112,6 +315,7 @@ export function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (auth.status !== 'signed-in' && auth.status !== 'offline') return;
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === 'k') {
         event.preventDefault();
@@ -150,6 +354,235 @@ export function App() {
     setTimeout(() => {
       setToast((current) => (current?.id === id ? null : current));
     }, 3000);
+  }
+
+  function applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot, recovery?: RecoveryBackup) {
+    setFolders(snapshot.folders);
+    setNotes(snapshot.notes);
+    setSettings(snapshot.settings);
+    setRecoveryBackup(recovery);
+    setSelectedNoteId(snapshot.settings.lastOpenedNoteId ?? snapshot.notes[0]?.id ?? null);
+    setSelectedFolderId('all');
+  }
+
+  async function openOfflineWorkspace(message: string) {
+    const local = await loadWorkspace();
+    applyWorkspaceSnapshot(workspaceFromLocal(local), local.recoveryBackup);
+    cloudSyncEnabled.current = false;
+    cloudRevisionRef.current = null;
+    setPendingCloud(null);
+    setCloudUpdatedAt(null);
+    setOfflineMessage(message);
+    setSyncState('offline');
+    setLoading(false);
+  }
+
+  async function openSignedInWorkspace() {
+    cloudSyncEnabled.current = false;
+    setLoading(true);
+    setAuthError(null);
+    setOfflineMessage(null);
+    setPendingCloud(null);
+
+    const local = await loadWorkspace();
+    const localSnapshot = workspaceFromLocal(local);
+    let cloud;
+    try {
+      cloud = await loadCloudWorkspace();
+    } catch {
+      applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
+      cloudSyncEnabled.current = false;
+      cloudRevisionRef.current = null;
+      setCloudUpdatedAt(null);
+      setOfflineMessage('Cloud sync is unavailable. Your local notes remain available on this device.');
+      setSyncState('offline');
+      setLoading(false);
+      return;
+    }
+
+    let snapshot = localSnapshot;
+    let backup = local.recoveryBackup;
+
+    if (cloud.workspace && !isFreshWorkspace(localSnapshot) && !sameWorkspace(localSnapshot, cloud.workspace)) {
+      applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
+      cloudRevisionRef.current = cloud.revision;
+      setCloudUpdatedAt(cloud.updatedAt);
+      setPendingCloud({ workspace: cloud.workspace, revision: cloud.revision, updatedAt: cloud.updatedAt });
+      setOfflineMessage('This device and your cloud workspace contain different changes. Choose which copy to keep.');
+      setSyncState('conflict');
+      setLoading(false);
+      return;
+    }
+
+    if (cloud.workspace) {
+      snapshot = cloud.workspace;
+      backup = undefined;
+      await replaceWorkspace(snapshot);
+      cloudRevisionRef.current = cloud.revision;
+      setCloudUpdatedAt(cloud.updatedAt);
+    } else {
+      try {
+        const result = await saveCloudWorkspace(snapshot, null);
+        cloudRevisionRef.current = result.revision;
+        setCloudUpdatedAt(result.updatedAt);
+      } catch {
+        applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
+        cloudSyncEnabled.current = false;
+        setOfflineMessage('Cloud sync is unavailable. Your local notes remain available on this device.');
+        setSyncState('offline');
+        setLoading(false);
+        return;
+      }
+    }
+
+    applyWorkspaceSnapshot(snapshot, backup);
+    setSyncState('synced');
+    setLoading(false);
+
+    window.setTimeout(() => {
+      cloudSyncEnabled.current = true;
+    }, 0);
+  }
+
+  async function enterSyncConflict() {
+    cloudSyncEnabled.current = false;
+    try {
+      const latest = await loadCloudWorkspace();
+      if (latest.workspace) {
+        setPendingCloud({ workspace: latest.workspace, revision: latest.revision, updatedAt: latest.updatedAt });
+        cloudRevisionRef.current = latest.revision;
+        setCloudUpdatedAt(latest.updatedAt);
+      }
+    } catch {
+      setOfflineMessage('Cloud sync is unavailable. Your local changes remain on this device.');
+      setSyncState('offline');
+      return;
+    }
+    setOfflineMessage('Cloud changes need your review before syncing can continue.');
+    setSyncState('conflict');
+    showToast('Choose which workspace copy to keep.', 'danger');
+  }
+
+  async function handleRetryCloudSync() {
+    setSyncState('syncing');
+    setOfflineMessage(null);
+    try {
+      const session = await getSession();
+      if (!session.authenticated || !session.user) {
+        setAuth({ status: 'signed-out', user: null });
+        setLoading(false);
+        return;
+      }
+      setAuth({ status: 'signed-in', user: session.user });
+      await openSignedInWorkspace();
+    } catch {
+      setOfflineMessage('Cloud sync is still unavailable. Your local notes remain available on this device.');
+      setSyncState('offline');
+    }
+  }
+
+  async function handleKeepLocalChanges() {
+    if (!pendingCloud || !settings) return;
+    const snapshot: WorkspaceSnapshot = { folders, notes, settings };
+    setSyncState('syncing');
+    try {
+      const result = await saveCloudWorkspace(snapshot, pendingCloud.revision);
+      cloudRevisionRef.current = result.revision;
+      setCloudUpdatedAt(result.updatedAt);
+      setPendingCloud(null);
+      setOfflineMessage(null);
+      setSyncState('synced');
+      cloudSyncEnabled.current = true;
+      showToast('This device is now synced');
+    } catch (error) {
+      if (error instanceof CloudApiError && error.status === 409) {
+        await enterSyncConflict();
+        return;
+      }
+      setOfflineMessage('Your local changes are safe on this device. Retry sync when the connection is available.');
+      setSyncState(error instanceof CloudApiError ? 'error' : 'offline');
+    }
+  }
+
+  async function handleUseCloudCopy() {
+    if (!pendingCloud) return;
+    setSyncState('syncing');
+    try {
+      await replaceWorkspace(pendingCloud.workspace);
+      applyWorkspaceSnapshot(pendingCloud.workspace);
+      cloudRevisionRef.current = pendingCloud.revision;
+      setCloudUpdatedAt(pendingCloud.updatedAt);
+      setPendingCloud(null);
+      setOfflineMessage(null);
+      setSyncState('synced');
+      cloudSyncEnabled.current = true;
+      showToast('Cloud workspace loaded');
+    } catch {
+      setOfflineMessage('The cloud copy could not be loaded. Your local notes remain unchanged.');
+      setSyncState('error');
+    }
+  }
+
+  async function handleGoogleCredential(credential: string) {
+    try {
+      setLoading(true);
+      setAuthError(null);
+      const result = await loginWithGoogle(credential);
+      setAuth({ status: 'signed-in', user: result.user });
+      await openSignedInWorkspace();
+      showToast('Workspace ready');
+    } catch (error) {
+      setLoading(false);
+      setAuth({ status: 'signed-out', user: null });
+      setAuthError(error instanceof Error ? error.message : 'Google sign-in failed. Please try again.');
+    }
+  }
+
+  async function handleSignOut() {
+    if (auth.status === 'signed-in' && syncState !== 'synced' && !window.confirm('Cloud sync is not complete. Sign out and clear this device\'s local copy anyway?')) return;
+    cloudSyncEnabled.current = false;
+    if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
+    if (auth.status === 'signed-in') {
+      await logoutFromCloud().catch(() => undefined);
+    }
+    await clearLocalWorkspace().catch(() => undefined);
+    window.google?.accounts.id.disableAutoSelect();
+    setAuth({ status: 'signed-out', user: null });
+    setFolders([]);
+    setNotes([]);
+    setSettings(null);
+    setSelectedNoteId(null);
+    setSelectedFolderId('all');
+    setCloudUpdatedAt(null);
+    cloudRevisionRef.current = null;
+    setPendingCloud(null);
+    setOfflineMessage(null);
+    setSyncState('idle');
+    setLoading(false);
+  }
+
+  async function handleDeleteAccount() {
+    if (!window.confirm('Delete your Notebook account, cloud data, and this device\'s local copy? This cannot be undone.')) return;
+
+    try {
+      await deleteCloudAccount();
+      await clearLocalWorkspace().catch(() => undefined);
+      window.google?.accounts.id.disableAutoSelect();
+      setAuth({ status: 'signed-out', user: null });
+      setFolders([]);
+      setNotes([]);
+      setSettings(null);
+      setSelectedNoteId(null);
+      setSelectedFolderId('all');
+      setCloudUpdatedAt(null);
+      setPendingCloud(null);
+      cloudRevisionRef.current = null;
+      setSyncState('idle');
+      setLoading(false);
+      showToast('Account and cloud data deleted');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Your account could not be deleted. Please try again.', 'danger');
+    }
   }
 
   async function handleCreateFolder() {
@@ -211,7 +644,7 @@ export function App() {
       await persistLastOpened(saved.id);
     } catch {
       if (requestId === saveRequest.current) setSaveState('error');
-      showToast('The note could not be saved.', 'danger');
+      showToast("Couldn't save this note. Please try again.", 'danger');
     }
   }
 
@@ -327,6 +760,7 @@ export function App() {
 
   async function handleImportFile(file: File | undefined) {
     if (!file) return;
+    if (!window.confirm('Import this backup and replace the current workspace? Export the current workspace first if you need to keep it.')) return;
 
     try {
       const snapshot = parseBackup(await file.text());
@@ -348,6 +782,20 @@ export function App() {
     ? visibleNotes.length === 0 && trashedFolders.length === 0
     : !emptyState && visibleNotes.length === 0;
 
+  if (auth.status === 'checking') {
+    return <WorkspaceLoadingScreen />;
+  }
+
+  if (auth.status === 'signed-out') {
+    return (
+      <AuthScreen
+        busy={loading}
+        error={authError}
+        onCredential={(credential) => void handleGoogleCredential(credential)}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -367,7 +815,49 @@ export function App() {
           <span>Command</span>
           <kbd>⌘K</kbd>
         </button>
+        <div className="cloud-account">
+          {syncState === 'offline' || syncState === 'error' || syncState === 'conflict' ? (
+            <button className={`sync-pill ${syncState}`} type="button" title="Retry workspace sync" onClick={() => void handleRetryCloudSync()}>
+              <RefreshCw size={14} />
+              {syncText(syncState)}
+            </button>
+          ) : (
+            <span className={`sync-pill ${syncState}`} title={cloudUpdatedAt ? `Last synced ${timeAgo(cloudUpdatedAt)}` : undefined}>
+              <Cloud size={14} />
+              {syncText(syncState)}
+            </span>
+          )}
+          {auth.user?.picture ? <img src={auth.user.picture} alt="" /> : <span className="account-initial">{auth.user?.email?.[0]?.toUpperCase() ?? 'U'}</span>}
+          <span className="account-email">{auth.user?.email ?? 'Offline workspace'}</span>
+          <button className="icon-button" type="button" aria-label={auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'} title={auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'} onClick={() => void handleSignOut()}>
+            <LogOut size={16} />
+          </button>
+        </div>
       </header>
+
+      {offlineMessage && !pendingCloud && (
+        <div className="workspace-alert" role="status">
+          <CloudOff size={16} />
+          <span>{offlineMessage}</span>
+          <button className="secondary-button" type="button" onClick={() => void handleRetryCloudSync()}>
+            <RefreshCw size={15} />
+            Retry sync
+          </button>
+        </div>
+      )}
+
+      {pendingCloud && (
+        <div className="workspace-alert conflict" role="alert">
+          <Cloud size={16} />
+          <span>{offlineMessage ?? 'Choose which workspace copy to keep.'}</span>
+          <button className="secondary-button" type="button" onClick={() => void handleKeepLocalChanges()}>
+            Keep this device
+          </button>
+          <button className="secondary-button" type="button" onClick={() => void handleUseCloudCopy()}>
+            Use cloud copy
+          </button>
+        </div>
+      )}
 
       <div className="workspace">
         {sidebarOpen && <button className="sidebar-scrim" type="button" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
@@ -419,6 +909,7 @@ export function App() {
                     <input
                       autoFocus
                       value={editingFolderName}
+                      maxLength={500}
                       aria-label="Folder name"
                       onBlur={() => void commitRenameFolder(folder.id)}
                       onChange={(event) => setEditingFolderName(event.target.value)}
@@ -466,7 +957,7 @@ export function App() {
             <div>
               <button type="button" onClick={exportJson}>
                 <Download size={16} />
-                Export JSON
+                Export JSON backup
               </button>
               <button type="button" onClick={exportMarkdown}>
                 <FileDown size={16} />
@@ -474,7 +965,7 @@ export function App() {
               </button>
               <button type="button" onClick={requestImport}>
                 <Import size={16} />
-                Import backup
+                Import JSON backup
               </button>
               {recoveryBackup && (
                 <button type="button" onClick={exportRecoveryBackup}>
@@ -483,7 +974,23 @@ export function App() {
                 </button>
               )}
             </div>
-            {recoveryBackup && <p className="backup-note">A safety copy from the last app upgrade is ready.</p>}
+          {recoveryBackup && <p className="backup-note">A recovery copy from a previous workspace update is available.</p>}
+          </details>
+
+          <details className="sidebar-actions">
+            <summary>Account</summary>
+            <div>
+              <button type="button" onClick={() => void handleSignOut()}>
+                <LogOut size={16} />
+                {auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'}
+              </button>
+              {auth.status === 'signed-in' && (
+                <button type="button" onClick={() => void handleDeleteAccount()}>
+                  <UserRoundX size={16} />
+                  Delete account and data
+                </button>
+              )}
+            </div>
           </details>
         </aside>
 
@@ -491,7 +998,7 @@ export function App() {
           <div className="list-header">
             <div>
               <h1>{query && selectedFolderId !== 'trash' ? 'Search results' : selectedFolderId === 'all' ? 'All notes' : selectedFolderId === 'favorites' ? 'Favorites' : selectedFolderId === 'unfiled' ? 'Unfiled' : selectedFolderId === 'trash' ? 'Trash' : folderName(folders, selectedFolderId)}</h1>
-              <p>{selectedFolderId === 'trash' ? `${visibleNotes.length} notes, ${trashedFolders.length} folders` : `${visibleNotes.length} visible notes`}</p>
+              <p>{selectedFolderId === 'trash' ? `${countLabel(visibleNotes.length, 'note')}, ${countLabel(trashedFolders.length, 'folder')}` : countLabel(visibleNotes.length, 'note')}</p>
             </div>
             {selectedFolderId !== 'trash' && (
               <button className="primary-button" type="button" onClick={() => void handleCreateNote()}>
@@ -511,13 +1018,13 @@ export function App() {
             <div className="empty-panel compact">
               <ArchiveRestore size={30} />
               <h2>Trash is empty</h2>
-              <p>Deleted notes and folders stay here until you restore them or delete them forever.</p>
+              <p>Items remain here until you restore them or permanently delete them.</p>
             </div>
           ) : emptyState ? (
             <div className="empty-panel">
               <FilePlus2 size={34} />
-              <h2>Start with one durable note</h2>
-              <p>Create an Inbox note, add a tag, then export a backup. That is the local-first loop.</p>
+              <h2>Start a new note</h2>
+              <p>Capture an idea, add context, and keep it organized in a folder.</p>
               <button className="primary-button" type="button" onClick={() => void handleCreateNote(activeFolders[0]?.id ?? null)}>
                 <Plus size={16} />
                 Create note
@@ -527,7 +1034,7 @@ export function App() {
             <div className="empty-panel compact">
               <Search size={30} />
               <h2>{query ? 'No matching notes' : 'No notes in this view'}</h2>
-              <p>{query ? 'Try a title, body phrase, backlink, or tag without changing your current notes.' : 'Create a note here or switch to All notes.'}</p>
+              <p>{query ? 'Try a different title, phrase, backlink, or tag.' : 'Create a note here or browse All notes.'}</p>
               <button className="primary-button" type="button" onClick={() => void handleCreateNote()}>
                 <Plus size={16} />
                 New note
@@ -543,7 +1050,7 @@ export function App() {
                       <span className={`folder-dot color-${folder.color}`} />
                       <span className="trash-row-main">
                         <strong>{folder.name}</strong>
-                        <span>{trashedNotes.filter((note) => note.folderId === folder.id).length} notes</span>
+                        <span>{countLabel(trashedNotes.filter((note) => note.folderId === folder.id).length, 'note')}</span>
                       </span>
                       <button className="secondary-button" type="button" onClick={() => void handleRestoreFolder(folder)}>
                         <ArchiveRestore size={15} />
@@ -562,7 +1069,7 @@ export function App() {
                     <span className={`note-color color-${note.color}`} />
                     <span className="note-card-main">
                       <span className="note-card-title">{note.title || 'Untitled note'}</span>
-                      <span className="note-card-text">{note.text || 'No content yet'}</span>
+                      <span className="note-card-text">{note.text || 'No text yet'}</span>
                       <span className="note-card-meta">{folderName(folders, note.folderId)} · Deleted {timeAgo(note.trashedAt ?? note.updatedAt)}</span>
                     </span>
                     <span className="trash-card-actions">
@@ -583,7 +1090,7 @@ export function App() {
                         {note.pinned && <Pin size={13} />}
                         {note.title || 'Untitled note'}
                       </span>
-                      <span className="note-card-text">{note.text || 'No content yet'}</span>
+                      <span className="note-card-text">{note.text || 'No text yet'}</span>
                       <span className="note-card-meta">
                         {folderName(folders, note.folderId)} · {timeAgo(note.updatedAt)}
                       </span>
@@ -617,7 +1124,7 @@ export function App() {
           ) : (
             <div className="empty-editor">
               <h2>No note selected</h2>
-              <p>Pick a note or create a new one from the command palette.</p>
+              <p>Select a note from the list or create a new one to begin writing.</p>
               <button className="primary-button" type="button" onClick={() => void handleCreateNote()}>
                 <Plus size={16} />
                 Create note
@@ -654,7 +1161,7 @@ export function App() {
       <input ref={importInputRef} type="file" accept="application/json" hidden onChange={(event) => void handleImportFile(event.target.files?.[0])} />
 
       <div className="sr-status" role="status" aria-live="polite">
-        {saveState === 'saving' ? 'Saving note' : saveState === 'saved' ? 'Note saved' : saveState === 'error' ? 'Save failed' : ''}
+        {saveState === 'saving' ? 'Saving note locally' : saveState === 'saved' ? 'Note saved locally' : saveState === 'error' ? 'Note could not be saved' : syncState === 'syncing' ? 'Syncing workspace' : ''}
       </div>
 
       {toast && (

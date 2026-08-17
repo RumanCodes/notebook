@@ -51,6 +51,10 @@ describe('backup import', () => {
     expect(() => parseBackup('{"hello":true}')).toThrow(/Notebook backup/);
   });
 
+  it('rejects oversized backup files before parsing', () => {
+    expect(() => parseBackup('x'.repeat(5 * 1024 * 1024 + 1))).toThrow(/too large/);
+  });
+
   it('preserves Trash records from a current backup', () => {
     const snapshot = parseBackup(JSON.stringify({
       appName: 'Notebook',

@@ -1,6 +1,9 @@
 import type { ColorName, Folder, LegacyV1Backup, Note, NotebookBackupV2, Settings, WorkspaceSnapshot } from '../types';
 import { legacyHtmlToDoc, jsonToText } from './content';
 
+const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+const MAX_IMPORTED_NOTES = 10000;
+const MAX_IMPORTED_FOLDERS = 1000;
 const colors = new Set<ColorName>(['slate', 'teal', 'blue', 'violet', 'amber', 'rose', 'green']);
 const legacyColorMap: Record<string, ColorName> = {
   default: 'slate',
@@ -13,6 +16,10 @@ const legacyColorMap: Record<string, ColorName> = {
 };
 
 export function parseBackup(raw: string): WorkspaceSnapshot {
+  if (raw.length > MAX_IMPORT_BYTES) {
+    throw new Error('This backup is too large to import.');
+  }
+
   let data: unknown;
   try {
     data = JSON.parse(raw);
@@ -21,6 +28,9 @@ export function parseBackup(raw: string): WorkspaceSnapshot {
   }
 
   if (isV2Backup(data)) {
+    if (data.notes.length > MAX_IMPORTED_NOTES || data.folders.length > MAX_IMPORTED_FOLDERS) {
+      throw new Error('This backup contains too many notes or folders.');
+    }
     return {
       folders: data.folders.map(normalizeFolder),
       notes: data.notes.map(normalizeNote),
@@ -29,6 +39,9 @@ export function parseBackup(raw: string): WorkspaceSnapshot {
   }
 
   if (isLegacyV1Backup(data)) {
+    if (data.notes.length > MAX_IMPORTED_NOTES || data.folders.length > MAX_IMPORTED_FOLDERS) {
+      throw new Error('This backup contains too many notes or folders.');
+    }
     return migrateLegacyV1(data);
   }
 

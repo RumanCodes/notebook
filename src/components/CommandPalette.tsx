@@ -47,8 +47,8 @@ export function CommandPalette({
     { label: 'Create note', icon: <FilePlus2 size={17} />, action: onCreateNote },
     { label: 'Create folder', icon: <FolderPlus size={17} />, action: onCreateFolder },
     { label: 'Export JSON backup', icon: <Download size={17} />, action: onExportJson },
-    { label: 'Export Markdown bundle', icon: <FileDown size={17} />, action: onExportMarkdown },
-    { label: 'Import V1 or V2 backup', icon: <Import size={17} />, action: onImport },
+    { label: 'Export Markdown', icon: <FileDown size={17} />, action: onExportMarkdown },
+    { label: 'Import JSON backup', icon: <Import size={17} />, action: onImport },
   ].filter((command) => command.label.toLowerCase().includes(query.toLowerCase()) || !query.trim());
 
   function run(action: () => void) {
@@ -61,7 +61,7 @@ export function CommandPalette({
       <div className="command-palette" role="dialog" aria-modal="true" aria-label="Command palette" onMouseDown={(event) => event.stopPropagation()}>
         <label className="palette-search">
           <Search size={18} />
-          <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Type a command or note title" />
+          <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commands and notes" />
         </label>
 
         <div className="palette-section">
@@ -86,7 +86,7 @@ export function CommandPalette({
                 </button>
               ))
             ) : (
-              <p>No notes matched.</p>
+              <p>No matching notes.</p>
             )}
           </div>
         )}
