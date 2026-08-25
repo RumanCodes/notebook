@@ -565,16 +565,60 @@ export async function getLatestRecoveryBackup(): Promise<RecoveryBackup | undefi
   return backups.sort((a, b) => b.createdAt - a.createdAt)[0];
 }
 
+export async function saveRecoveryBackup(snapshot: WorkspaceSnapshot, sourceVersion = DB_VERSION): Promise<RecoveryBackup> {
+  return put(stores.recoveryBackups, {
+    id: uid('recovery'),
+    sourceVersion,
+    createdAt: Date.now(),
+    folders: snapshot.folders,
+    notes: snapshot.notes,
+    settings: snapshot.settings,
+  });
+}
+
 export async function saveSettings(settings: Settings): Promise<Settings> {
   return put(stores.settings, { ...settings, updatedAt: Date.now() });
 }
 
 export async function replaceWorkspace(snapshot: WorkspaceSnapshot): Promise<void> {
-  await Promise.all(Object.values(stores).map(clear));
-  await Promise.all(snapshot.folders.map((folder) => put(stores.folders, folder)));
-  await Promise.all(snapshot.notes.map((note) => put(stores.notes, note)));
-  await put(stores.settings, snapshot.settings);
-  await rebuildLinks(snapshot.notes);
+  const db = await openDb();
+  const replaceableStores = [
+    stores.folders,
+    stores.notes,
+    stores.settings,
+    stores.links,
+    stores.attachments,
+    stores.commandHistory,
+  ] as const;
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(replaceableStores, 'readwrite');
+    const folderStore = transaction.objectStore(stores.folders);
+    const noteStore = transaction.objectStore(stores.notes);
+    const settingsStore = transaction.objectStore(stores.settings);
+    const linkStore = transaction.objectStore(stores.links);
+
+    replaceableStores.forEach((storeName) => transaction.objectStore(storeName).clear());
+    snapshot.folders.forEach((folder) => folderStore.put(folder));
+    snapshot.notes.forEach((note) => {
+      noteStore.put(note);
+      extractWikiLinks(note.text).forEach((targetTitle) => {
+        linkStore.put({
+          id: uid('link'),
+          sourceNoteId: note.id,
+          targetNoteId: null,
+          targetTitle,
+          kind: 'wiki',
+          createdAt: Date.now(),
+        } satisfies LinkRecord);
+      });
+    });
+    settingsStore.put(snapshot.settings);
+
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not replace the local workspace.'));
+    transaction.onabort = () => reject(transaction.error ?? new Error('Could not replace the local workspace.'));
+  });
 }
 
 export async function clearLocalWorkspace(): Promise<void> {

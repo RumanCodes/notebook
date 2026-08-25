@@ -100,3 +100,12 @@ export async function saveCloudWorkspace(workspace: WorkspaceSnapshot, baseRevis
     body: JSON.stringify({ workspace, baseRevision }),
   });
 }
+
+export async function saveAndVerifyCloudWorkspace(workspace: WorkspaceSnapshot, baseRevision: number | null): Promise<{ revision: number; updatedAt: number }> {
+  const saved = await saveCloudWorkspace(workspace, baseRevision);
+  const verified = await loadCloudWorkspace();
+  if (verified.revision !== saved.revision || !verified.workspace || JSON.stringify(verified.workspace) !== JSON.stringify(workspace)) {
+    throw new CloudApiError('Cloud workspace could not be verified after saving.', 0);
+  }
+  return saved;
+}

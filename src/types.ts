@@ -1,5 +1,7 @@
 export type EntityId = string;
 
+export type StorageMode = 'local' | 'cloud';
+
 export type ColorName =
   | 'slate'
   | 'teal'

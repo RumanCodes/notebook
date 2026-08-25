@@ -4,10 +4,13 @@ import {
   Cloud,
   CloudOff,
   Command,
+  Database,
   Download,
   FileDown,
   FilePlus2,
   FolderPlus,
+  GitMerge,
+  HardDrive,
   Import,
   LogOut,
   Menu,
@@ -37,11 +40,13 @@ import {
   loadCloudWorkspace,
   loginWithGoogle,
   logoutFromCloud,
+  saveAndVerifyCloudWorkspace,
   saveCloudWorkspace,
   type CloudUser,
 } from './lib/cloud';
 import { createBackup, downloadText, exportNoteMarkdown, exportWorkspaceMarkdown, safeFilename } from './lib/export';
 import { parseBackup } from './lib/import';
+import { mergeWorkspaces, sameWorkspace, type WorkspaceMergeConflict } from './lib/migration';
 import {
   clearLocalWorkspace,
   createFolder,
@@ -53,6 +58,7 @@ import {
   loadWorkspace,
   recordCommand,
   replaceWorkspace,
+  saveRecoveryBackup,
   saveFolder,
   saveNote,
   saveSettings,
@@ -60,13 +66,20 @@ import {
   trashNote,
 } from './lib/repository';
 import { rankNotes } from './lib/search';
-import type { EntityId, Folder, Note, RecoveryBackup, Settings, WorkspaceSnapshot } from './types';
+import { clearStorageMode, getStorageMode, setStorageMode } from './lib/storage-mode';
+import type { EntityId, Folder, Note, RecoveryBackup, Settings, StorageMode, WorkspaceSnapshot } from './types';
 
 type ViewId = EntityId | 'all' | 'favorites' | 'unfiled' | 'trash';
 type ToastState = { id: string; tone: 'info' | 'danger'; message: string; action?: { label: string; run: () => Promise<void> } };
-type AuthState = { status: 'checking' | 'signed-out' | 'signed-in' | 'offline'; user: CloudUser | null };
+type AuthState = { status: 'checking' | 'signed-out' | 'signed-in' | 'local'; user: CloudUser | null };
 type SyncState = 'idle' | 'syncing' | 'synced' | 'error' | 'conflict' | 'offline';
 type PendingCloudWorkspace = { workspace: WorkspaceSnapshot; revision: number | null; updatedAt: number | null };
+type PendingMigration = {
+  local: WorkspaceSnapshot;
+  cloud: PendingCloudWorkspace | null;
+  conflicts?: WorkspaceMergeConflict[];
+  error?: string;
+};
 
 let googleScriptPromise: Promise<void> | null = null;
 
@@ -133,22 +146,79 @@ function syncText(state: SyncState): string {
   return 'Ready';
 }
 
-function AuthScreen({ busy, error, onCredential }: { busy: boolean; error: string | null; onCredential: (credential: string) => void }) {
+function StorageChoiceScreen({ busy, error, onCredential, onChooseLocal }: { busy: boolean; error: string | null; onCredential: (credential: string) => void; onChooseLocal: () => void }) {
   return (
     <div className="auth-shell">
-      <section className="auth-panel" aria-labelledby="auth-title">
+      <section className="auth-panel storage-choice" aria-labelledby="auth-title">
         <span className="brand-mark">N</span>
-        <h1 id="auth-title">Notebook</h1>
-        <p>Notebook is a private, local-first notes app for writing, organizing, searching, and connecting ideas. Sign in to keep your workspace synced and available on every device.</p>
-        {isCloudConfigured() ? (
-          <GoogleSignInButton onCredential={onCredential} disabled={busy} />
-        ) : (
-          <div className="auth-error">Google sign-in is not configured. Add VITE_GOOGLE_CLIENT_ID before building.</div>
-        )}
+        <h1 id="auth-title">How would you like to store your notes?</h1>
+        <p>Notebook works fully offline. Choose local storage for this browser, or connect Google when you want the same workspace on other devices.</p>
+        <div className="storage-choice-list">
+          <div className="storage-choice-row">
+            <div className="storage-choice-icon cloud"><Cloud size={20} /></div>
+            <div>
+              <h2>Continue with Google</h2>
+              <p>Access your notes from any device and keep them synchronized.</p>
+              {isCloudConfigured() ? <GoogleSignInButton onCredential={onCredential} disabled={busy} /> : <span className="auth-status">Google sync is not configured for this deployment.</span>}
+            </div>
+          </div>
+          <div className="storage-choice-row">
+            <div className="storage-choice-icon local"><HardDrive size={20} /></div>
+            <div>
+              <h2>Use Local Storage</h2>
+              <p>Keep your notes in this browser without an account. You can connect Google later from Account.</p>
+              <button className="secondary-button storage-choice-button" type="button" onClick={onChooseLocal} disabled={busy}>Continue locally</button>
+            </div>
+          </div>
+        </div>
         {busy && <span className="auth-status">Opening your workspace</span>}
         {error && <div className="auth-error">{error}</div>}
       </section>
     </div>
+  );
+}
+
+function MigrationPanel({ migration, busy, onMigrate, onKeepLocal, onKeepCloud, onMerge, onCancel }: {
+  migration: PendingMigration;
+  busy: boolean;
+  onMigrate: () => void;
+  onKeepLocal: () => void;
+  onKeepCloud: () => void;
+  onMerge: () => void;
+  onCancel: () => void;
+}) {
+  const isEmpty = !migration.cloud?.workspace;
+  return (
+    <section className="migration-panel" role="dialog" aria-labelledby="migration-title" aria-describedby="migration-description">
+      <div className="migration-icon"><Database size={20} /></div>
+      <div className="migration-copy">
+        <h2 id="migration-title">{isEmpty ? 'Connect your local workspace?' : 'Choose what to do with your workspaces'}</h2>
+        <p id="migration-description">
+          {isEmpty
+            ? 'Your Google cloud workspace is empty. Uploading your local workspace will keep this browser copy and create the cloud copy.'
+            : 'Notebook found data in both places. Choose deliberately before anything is replaced.'}
+        </p>
+        {migration.conflicts && migration.conflicts.length > 0 && (
+          <div className="migration-conflicts" role="alert">
+            <strong>Merge needs your decision</strong>
+            <span>{migration.conflicts.map((conflict) => `${conflict.kind}: ${conflict.label}`).join(', ')}</span>
+          </div>
+        )}
+        {migration.error && <div className="auth-error">{migration.error}</div>}
+      </div>
+      <div className="migration-actions">
+        {isEmpty ? (
+          <button className="primary-button" type="button" onClick={onMigrate} disabled={busy}>{busy ? 'Migrating…' : 'Migrate local workspace'}</button>
+        ) : (
+          <>
+            <button className="primary-button" type="button" onClick={onKeepLocal} disabled={busy}>Keep local</button>
+            <button className="secondary-button" type="button" onClick={onKeepCloud} disabled={busy}>Keep cloud</button>
+            <button className="secondary-button" type="button" onClick={onMerge} disabled={busy}><GitMerge size={15} /> Merge</button>
+          </>
+        )}
+        <button className="secondary-button" type="button" onClick={onCancel} disabled={busy}>Keep using local</button>
+      </div>
+    </section>
   );
 }
 
@@ -199,10 +269,6 @@ function isFreshWorkspace(snapshot: WorkspaceSnapshot): boolean {
     && snapshot.notes[0]?.tags.includes('getting-started');
 }
 
-function sameWorkspace(left: WorkspaceSnapshot, right: WorkspaceSnapshot): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
 function uniqueTags(notes: Note[]): string[] {
   return [...new Set(notes.flatMap((note) => note.tags))].sort((a, b) => a.localeCompare(b));
 }
@@ -222,10 +288,13 @@ export function App() {
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [syncState, setSyncState] = useState<SyncState>('idle');
   const [auth, setAuth] = useState<AuthState>({ status: 'checking', user: null });
+  const [storageMode, setStorageModeState] = useState<StorageMode | null>(() => getStorageMode());
   const [authError, setAuthError] = useState<string | null>(null);
   const [offlineMessage, setOfflineMessage] = useState<string | null>(null);
   const [cloudUpdatedAt, setCloudUpdatedAt] = useState<number | null>(null);
   const [pendingCloud, setPendingCloud] = useState<PendingCloudWorkspace | null>(null);
+  const [migration, setMigration] = useState<PendingMigration | null>(null);
+  const [migrationBusy, setMigrationBusy] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [recoveryBackup, setRecoveryBackup] = useState<RecoveryBackup | undefined>();
   const [loading, setLoading] = useState(true);
@@ -239,6 +308,12 @@ export function App() {
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
+
+    const storedMode = getStorageMode();
+    if (storedMode === 'local') {
+      void openLocalWorkspace();
+      return;
+    }
 
     if (!isCloudConfigured()) {
       setAuth({ status: 'signed-out', user: null });
@@ -254,23 +329,27 @@ export function App() {
           return;
         }
 
+        setStorageModeState('cloud');
+        setStorageMode('cloud');
         setAuth({ status: 'signed-in', user: session.user });
         await openSignedInWorkspace();
       })
       .catch(async (error) => {
-        try {
-          await openOfflineWorkspace("Cloud sync is unavailable. Your local notes remain available on this device.");
-          setAuth({ status: 'offline', user: null });
-        } catch {
-          setAuth({ status: 'signed-out', user: null });
-          setAuthError(error instanceof Error ? error.message : "We couldn't open your workspace. Check your connection and try again.");
-          setLoading(false);
+        if (storedMode === 'cloud' && error instanceof CloudApiError && error.status === 0) {
+          await openCloudCachedWorkspace('Cloud sync is unavailable. Your local notes remain available and will sync when the connection returns.');
+          setAuth({ status: 'signed-in', user: null });
+          setStorageModeState('cloud');
+          return;
         }
+
+        setAuth({ status: 'signed-out', user: null });
+        setAuthError(error instanceof Error ? error.message : "We couldn't check your Google session. You can continue locally.");
+        setLoading(false);
       });
   }, []);
 
   useEffect(() => {
-    if (!settings || auth.status !== 'signed-in' || !cloudSyncEnabled.current) return;
+    if (!settings || storageMode !== 'cloud' || auth.status !== 'signed-in' || !cloudSyncEnabled.current) return;
     if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
 
     const snapshot: WorkspaceSnapshot = { folders, notes, settings };
@@ -297,11 +376,21 @@ export function App() {
     return () => {
       if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
     };
-  }, [auth.status, folders, notes, settings]);
+  }, [auth.status, folders, notes, settings, storageMode]);
 
   useEffect(() => () => {
     if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
   }, []);
+
+  useEffect(() => {
+    if (storageMode !== 'cloud') return;
+    function onOnline() {
+      if (syncState === 'offline' || syncState === 'error') void handleRetryCloudSync();
+    }
+
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [storageMode, syncState]);
 
   useEffect(() => {
     function onResize() {
@@ -315,7 +404,7 @@ export function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (auth.status !== 'signed-in' && auth.status !== 'offline') return;
+      if (auth.status !== 'signed-in' && auth.status !== 'local') return;
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === 'k') {
         event.preventDefault();
@@ -365,36 +454,57 @@ export function App() {
     setSelectedFolderId('all');
   }
 
-  async function openOfflineWorkspace(message: string) {
+  async function openLocalWorkspace(message?: string) {
     const local = await loadWorkspace();
     applyWorkspaceSnapshot(workspaceFromLocal(local), local.recoveryBackup);
     cloudSyncEnabled.current = false;
     cloudRevisionRef.current = null;
     setPendingCloud(null);
+    setMigration(null);
+    setCloudUpdatedAt(null);
+    setOfflineMessage(message ?? null);
+    setSyncState(message ? 'offline' : 'idle');
+    setStorageModeState('local');
+    setStorageMode('local');
+    setAuth({ status: 'local', user: null });
+    setLoading(false);
+  }
+
+  async function openCloudCachedWorkspace(message: string) {
+    const local = await loadWorkspace();
+    applyWorkspaceSnapshot(workspaceFromLocal(local), local.recoveryBackup);
+    cloudSyncEnabled.current = false;
+    cloudRevisionRef.current = null;
+    setMigration(null);
     setCloudUpdatedAt(null);
     setOfflineMessage(message);
     setSyncState('offline');
     setLoading(false);
   }
 
-  async function openSignedInWorkspace() {
+  async function openSignedInWorkspace(forceMigration = false) {
     cloudSyncEnabled.current = false;
     setLoading(true);
     setAuthError(null);
     setOfflineMessage(null);
     setPendingCloud(null);
+    setMigration(null);
+    cloudRevisionRef.current = null;
+    setCloudUpdatedAt(null);
 
     const local = await loadWorkspace();
     const localSnapshot = workspaceFromLocal(local);
     let cloud;
     try {
       cloud = await loadCloudWorkspace();
-    } catch {
+    } catch (error) {
       applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
       cloudSyncEnabled.current = false;
       cloudRevisionRef.current = null;
       setCloudUpdatedAt(null);
-      setOfflineMessage('Cloud sync is unavailable. Your local notes remain available on this device.');
+      setOfflineMessage(error instanceof CloudApiError && error.status === 401
+        ? 'Your Google session has expired. Sign in again to resume cloud sync.'
+        : 'Cloud sync is unavailable. Your local notes remain available on this device.');
       setSyncState('offline');
       setLoading(false);
       return;
@@ -403,37 +513,35 @@ export function App() {
     let snapshot = localSnapshot;
     let backup = local.recoveryBackup;
 
-    if (cloud.workspace && !isFreshWorkspace(localSnapshot) && !sameWorkspace(localSnapshot, cloud.workspace)) {
+    if (cloud.workspace && (forceMigration || (!isFreshWorkspace(localSnapshot) && !sameWorkspace(localSnapshot, cloud.workspace)))) {
       applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
       cloudRevisionRef.current = cloud.revision;
       setCloudUpdatedAt(cloud.updatedAt);
-      setPendingCloud({ workspace: cloud.workspace, revision: cloud.revision, updatedAt: cloud.updatedAt });
-      setOfflineMessage('This device and your cloud workspace contain different changes. Choose which copy to keep.');
-      setSyncState('conflict');
+      if (forceMigration) {
+        setMigration({ local: localSnapshot, cloud: { workspace: cloud.workspace, revision: cloud.revision, updatedAt: cloud.updatedAt } });
+        setSyncState('idle');
+      } else {
+        setPendingCloud({ workspace: cloud.workspace, revision: cloud.revision, updatedAt: cloud.updatedAt });
+        setOfflineMessage('This device and your cloud workspace contain different changes. Choose which copy to keep.');
+        setSyncState('conflict');
+      }
       setLoading(false);
       return;
     }
 
-    if (cloud.workspace) {
-      snapshot = cloud.workspace;
-      backup = undefined;
-      await replaceWorkspace(snapshot);
-      cloudRevisionRef.current = cloud.revision;
-      setCloudUpdatedAt(cloud.updatedAt);
-    } else {
-      try {
-        const result = await saveCloudWorkspace(snapshot, null);
-        cloudRevisionRef.current = result.revision;
-        setCloudUpdatedAt(result.updatedAt);
-      } catch {
-        applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
-        cloudSyncEnabled.current = false;
-        setOfflineMessage('Cloud sync is unavailable. Your local notes remain available on this device.');
-        setSyncState('offline');
-        setLoading(false);
-        return;
-      }
+    if (!cloud.workspace) {
+      applyWorkspaceSnapshot(localSnapshot, local.recoveryBackup);
+      setMigration({ local: localSnapshot, cloud: null });
+      setSyncState('idle');
+      setLoading(false);
+      return;
     }
+
+    snapshot = cloud.workspace;
+    backup = undefined;
+    await replaceWorkspace(snapshot);
+    cloudRevisionRef.current = cloud.revision;
+    setCloudUpdatedAt(cloud.updatedAt);
 
     applyWorkspaceSnapshot(snapshot, backup);
     setSyncState('synced');
@@ -469,13 +577,20 @@ export function App() {
     try {
       const session = await getSession();
       if (!session.authenticated || !session.user) {
+        setStorageModeState(null);
         setAuth({ status: 'signed-out', user: null });
         setLoading(false);
         return;
       }
+      setStorageModeState('cloud');
+      setStorageMode('cloud');
       setAuth({ status: 'signed-in', user: session.user });
       await openSignedInWorkspace();
-    } catch {
+    } catch (error) {
+      if (error instanceof CloudApiError && error.status === 0) {
+        await openCloudCachedWorkspace('Cloud sync is still unavailable. Your local changes remain safe and will retry when the connection returns.');
+        return;
+      }
       setOfflineMessage('Cloud sync is still unavailable. Your local notes remain available on this device.');
       setSyncState('offline');
     }
@@ -508,6 +623,7 @@ export function App() {
     if (!pendingCloud) return;
     setSyncState('syncing');
     try {
+      if (settings) await saveRecoveryBackup({ folders, notes, settings });
       await replaceWorkspace(pendingCloud.workspace);
       applyWorkspaceSnapshot(pendingCloud.workspace);
       cloudRevisionRef.current = pendingCloud.revision;
@@ -523,22 +639,140 @@ export function App() {
     }
   }
 
+  function finishCloudMigration(snapshot: WorkspaceSnapshot, result: { revision: number; updatedAt: number }, recovery?: RecoveryBackup) {
+    setStorageModeState('cloud');
+    setStorageMode('cloud');
+    setMigration(null);
+    setPendingCloud(null);
+    setOfflineMessage(null);
+    setCloudUpdatedAt(result.updatedAt);
+    cloudRevisionRef.current = result.revision;
+    cloudSyncEnabled.current = true;
+    applyWorkspaceSnapshot(snapshot, recovery);
+    setSyncState('synced');
+    setLoading(false);
+    showToast('Google account connected');
+  }
+
+  async function handleMigrateLocalWorkspace() {
+    if (!migration || migration.cloud) return;
+    setMigrationBusy(true);
+    try {
+      const local = workspaceFromLocal(await loadWorkspace());
+      // Revision 0 means "the workspace must still be absent". The API will
+      // reject a concurrent workspace creation instead of overwriting it.
+      const result = await saveAndVerifyCloudWorkspace(local, 0);
+      finishCloudMigration(local, result);
+    } catch (error) {
+      setMigration((current) => current ? { ...current, error: error instanceof Error ? error.message : 'The local workspace could not be migrated.' } : current);
+    } finally {
+      setMigrationBusy(false);
+    }
+  }
+
+  async function handleKeepLocalMigration() {
+    if (!migration?.cloud) return;
+    setMigrationBusy(true);
+    try {
+      const local = workspaceFromLocal(await loadWorkspace());
+      const result = await saveAndVerifyCloudWorkspace(local, migration.cloud.revision);
+      finishCloudMigration(local, result);
+    } catch (error) {
+      if (error instanceof CloudApiError && error.status === 409) {
+        setMigration((current) => current ? { ...current, error: 'The cloud workspace changed while you were deciding. Reload the choices and try again.' } : current);
+      } else {
+        setMigration((current) => current ? { ...current, error: error instanceof Error ? error.message : 'The local workspace could not be uploaded.' } : current);
+      }
+    } finally {
+      setMigrationBusy(false);
+    }
+  }
+
+  async function handleKeepCloudMigration() {
+    if (!migration?.cloud) return;
+    if (!window.confirm('Replace this browser\'s local workspace with the cloud workspace? A recovery copy of the local workspace will be kept in IndexedDB.')) return;
+    setMigrationBusy(true);
+    try {
+      const local = workspaceFromLocal(await loadWorkspace());
+      const recovery = await saveRecoveryBackup(local);
+      await replaceWorkspace(migration.cloud.workspace);
+      const verifiedLocal = workspaceFromLocal(await loadWorkspace());
+      if (!sameWorkspace(verifiedLocal, migration.cloud.workspace)) throw new Error('The cloud workspace could not be verified in this browser.');
+      finishCloudMigration(migration.cloud.workspace, { revision: migration.cloud.revision ?? 0, updatedAt: migration.cloud.updatedAt ?? Date.now() }, recovery);
+    } catch (error) {
+      setMigration((current) => current ? { ...current, error: error instanceof Error ? error.message : 'The cloud workspace could not be loaded locally.' } : current);
+    } finally {
+      setMigrationBusy(false);
+    }
+  }
+
+  async function handleMergeMigration() {
+    if (!migration?.cloud) return;
+    const local = workspaceFromLocal(await loadWorkspace());
+    const merged = mergeWorkspaces(local, migration.cloud.workspace);
+    if (!merged.workspace) {
+      setMigration((current) => current ? { ...current, conflicts: merged.conflicts, error: 'These records were edited independently. Choose Keep local or Keep cloud before syncing.' } : current);
+      return;
+    }
+
+    setMigrationBusy(true);
+    try {
+      const result = await saveAndVerifyCloudWorkspace(merged.workspace, migration.cloud.revision);
+      const recovery = await saveRecoveryBackup(local);
+      await replaceWorkspace(merged.workspace);
+      const verifiedLocal = workspaceFromLocal(await loadWorkspace());
+      if (!sameWorkspace(verifiedLocal, merged.workspace)) throw new Error('The merged workspace could not be verified in this browser.');
+      finishCloudMigration(merged.workspace, result, recovery);
+    } catch (error) {
+      setMigration((current) => current ? { ...current, error: error instanceof Error ? error.message : 'The workspaces could not be merged safely.' } : current);
+    } finally {
+      setMigrationBusy(false);
+    }
+  }
+
+  async function handleCancelMigration() {
+    setMigrationBusy(true);
+    await logoutFromCloud().catch(() => undefined);
+    await openLocalWorkspace();
+    showToast('Still using local storage');
+    setMigrationBusy(false);
+  }
+
   async function handleGoogleCredential(credential: string) {
+    const previousMode = storageMode;
+    let cloudAuthenticated = false;
     try {
       setLoading(true);
       setAuthError(null);
       const result = await loginWithGoogle(credential);
+      cloudAuthenticated = true;
+      setStorageModeState('cloud');
+      setStorageMode('cloud');
       setAuth({ status: 'signed-in', user: result.user });
-      await openSignedInWorkspace();
-      showToast('Workspace ready');
+      await openSignedInWorkspace(previousMode !== 'cloud');
     } catch (error) {
+      if (cloudAuthenticated && previousMode === 'local') await logoutFromCloud().catch(() => undefined);
       setLoading(false);
-      setAuth({ status: 'signed-out', user: null });
+      if (previousMode === 'local') {
+        setAuth({ status: 'local', user: null });
+        setStorageModeState('local');
+        setStorageMode('local');
+      } else {
+        setAuth({ status: 'signed-out', user: null });
+      }
       setAuthError(error instanceof Error ? error.message : 'Google sign-in failed. Please try again.');
     }
   }
 
   async function handleSignOut() {
+    if (auth.status === 'local') {
+      if (!window.confirm('Clear the local workspace from this browser? Export a backup first if you need to keep it.')) return;
+      await clearLocalWorkspace().catch(() => undefined);
+      await openLocalWorkspace();
+      showToast('Local workspace cleared');
+      return;
+    }
+
     if (auth.status === 'signed-in' && syncState !== 'synced' && !window.confirm('Cloud sync is not complete. Sign out and clear this device\'s local copy anyway?')) return;
     cloudSyncEnabled.current = false;
     if (cloudSyncTimer.current !== null) window.clearTimeout(cloudSyncTimer.current);
@@ -548,6 +782,8 @@ export function App() {
     await clearLocalWorkspace().catch(() => undefined);
     window.google?.accounts.id.disableAutoSelect();
     setAuth({ status: 'signed-out', user: null });
+    setStorageModeState(null);
+    clearStorageMode();
     setFolders([]);
     setNotes([]);
     setSettings(null);
@@ -556,6 +792,7 @@ export function App() {
     setCloudUpdatedAt(null);
     cloudRevisionRef.current = null;
     setPendingCloud(null);
+    setMigration(null);
     setOfflineMessage(null);
     setSyncState('idle');
     setLoading(false);
@@ -569,6 +806,8 @@ export function App() {
       await clearLocalWorkspace().catch(() => undefined);
       window.google?.accounts.id.disableAutoSelect();
       setAuth({ status: 'signed-out', user: null });
+      setStorageModeState(null);
+      clearStorageMode();
       setFolders([]);
       setNotes([]);
       setSettings(null);
@@ -576,6 +815,7 @@ export function App() {
       setSelectedFolderId('all');
       setCloudUpdatedAt(null);
       setPendingCloud(null);
+      setMigration(null);
       cloudRevisionRef.current = null;
       setSyncState('idle');
       setLoading(false);
@@ -788,10 +1028,11 @@ export function App() {
 
   if (auth.status === 'signed-out') {
     return (
-      <AuthScreen
+      <StorageChoiceScreen
         busy={loading}
         error={authError}
         onCredential={(credential) => void handleGoogleCredential(credential)}
+        onChooseLocal={() => void openLocalWorkspace()}
       />
     );
   }
@@ -816,7 +1057,9 @@ export function App() {
           <kbd>⌘K</kbd>
         </button>
         <div className="cloud-account">
-          {syncState === 'offline' || syncState === 'error' || syncState === 'conflict' ? (
+          {storageMode === 'local' ? (
+            <span className="sync-pill local"><HardDrive size={14} /> Local Storage</span>
+          ) : syncState === 'offline' || syncState === 'error' || syncState === 'conflict' ? (
             <button className={`sync-pill ${syncState}`} type="button" title="Retry workspace sync" onClick={() => void handleRetryCloudSync()}>
               <RefreshCw size={14} />
               {syncText(syncState)}
@@ -827,9 +1070,9 @@ export function App() {
               {syncText(syncState)}
             </span>
           )}
-          {auth.user?.picture ? <img src={auth.user.picture} alt="" /> : <span className="account-initial">{auth.user?.email?.[0]?.toUpperCase() ?? 'U'}</span>}
-          <span className="account-email">{auth.user?.email ?? 'Offline workspace'}</span>
-          <button className="icon-button" type="button" aria-label={auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'} title={auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'} onClick={() => void handleSignOut()}>
+          {storageMode === 'cloud' && (auth.user?.picture ? <img src={auth.user.picture} alt="" /> : <span className="account-initial">{auth.user?.email?.[0]?.toUpperCase() ?? 'U'}</span>)}
+          <span className="account-email">{storageMode === 'local' ? 'Local Storage' : auth.user?.email ?? 'Cloud account unavailable'}</span>
+          <button className="icon-button" type="button" aria-label={storageMode === 'local' ? 'Clear local workspace' : 'Sign out'} title={storageMode === 'local' ? 'Clear local workspace' : 'Sign out'} onClick={() => void handleSignOut()}>
             <LogOut size={16} />
           </button>
         </div>
@@ -857,6 +1100,18 @@ export function App() {
             Use cloud copy
           </button>
         </div>
+      )}
+
+      {migration && (
+        <MigrationPanel
+          migration={migration}
+          busy={migrationBusy}
+          onMigrate={() => void handleMigrateLocalWorkspace()}
+          onKeepLocal={() => void handleKeepLocalMigration()}
+          onKeepCloud={() => void handleKeepCloudMigration()}
+          onMerge={() => void handleMergeMigration()}
+          onCancel={() => void handleCancelMigration()}
+        />
       )}
 
       <div className="workspace">
@@ -980,11 +1235,18 @@ export function App() {
           <details className="sidebar-actions">
             <summary>Account</summary>
             <div>
+              {storageMode === 'local' && (
+                <div className="account-local-summary">
+                  <strong>Local Storage</strong>
+                  <span>Your notes are currently stored only in this browser.</span>
+                  {isCloudConfigured() ? <GoogleSignInButton onCredential={(credential) => void handleGoogleCredential(credential)} disabled={loading || migrationBusy} /> : <span className="auth-status">Google sync is not configured.</span>}
+                </div>
+              )}
               <button type="button" onClick={() => void handleSignOut()}>
                 <LogOut size={16} />
-                {auth.status === 'offline' ? 'Clear local workspace' : 'Sign out'}
+                {storageMode === 'local' ? 'Clear local workspace' : 'Sign out'}
               </button>
-              {auth.status === 'signed-in' && (
+              {storageMode === 'cloud' && auth.user && (
                 <button type="button" onClick={() => void handleDeleteAccount()}>
                   <UserRoundX size={16} />
                   Delete account and data

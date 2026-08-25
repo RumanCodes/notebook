@@ -15,7 +15,7 @@ npm run build
 
 Notebook stores data locally in IndexedDB with stores for notes, folders, settings, links, attachment metadata, command history, and migration recovery copies. The current database version is 3. Existing V2 data is upgraded in place, with an internal recovery copy created before records are migrated. If the current workspace is empty, startup also checks the legacy `notebook_app_db` and migrates its notes automatically. The import flow accepts the existing V1 JSON backup shape from `notebook-app.html` and earlier Notebook JSON backups.
 
-Editor changes are autosaved after a short debounce, flushed when the note changes or the page is hidden, and serialized per note so an older write cannot overwrite a newer one. A small synchronous `localStorage` pending-draft journal is also replayed into IndexedDB on the next load; this protects edits made immediately before a reload or tab close. The production Hostinger deployment uses Google sign-in plus the PHP/MySQL API in `public/api/` so each authenticated user's workspace is also saved permanently in MySQL. IndexedDB remains the local working cache.
+Editor changes are autosaved after a short debounce, flushed when the note changes or the page is hidden, and serialized per note so an older write cannot overwrite a newer one. A small synchronous `localStorage` pending-draft journal is also replayed into IndexedDB on the next load; this protects edits made immediately before a reload or tab close. Notebook starts with a choice between local browser storage and optional Google/MySQL sync. Local mode uses IndexedDB only and makes no API requests. Cloud mode keeps IndexedDB as the working store and saves each workspace snapshot to the authenticated user's MySQL row. A local workspace can be connected to Google later through the Account section with explicit Keep local, Keep cloud, or safe Merge choices.
 
 Deleting a note or folder first moves it to Trash. Folder deletion keeps its notes together. Trash supports restore, Undo immediately after deletion, and permanent deletion behind an explicit confirmation. Permanent deletion is the only destructive delete action in the normal interface.
 
@@ -87,12 +87,14 @@ Upload the contents of `dist/` to the domain's `public_html/`. Vite copies the P
 
 ### 5. Runtime Behavior
 
-- Signed-out users see the Google sign-in screen.
-- First sign-in creates or uploads that user's workspace.
+- New users choose between Local Storage and Continue with Google.
+- Local users can use the complete app offline and connect Google later from Account.
+- First Google connection compares local and cloud workspaces before uploading or replacing anything.
 - Later sign-ins load the user's MySQL workspace back into IndexedDB.
-- Every local edit is saved to IndexedDB first and then synced to MySQL.
+- In cloud mode, every local edit is saved to IndexedDB first and then synced to MySQL.
+- In local mode, no Google, API, or MySQL requests are made after the mode is selected.
 - If the API is unavailable, the local workspace remains usable and shows a retry control.
-- If local and cloud workspaces differ, the app pauses syncing and lets the user keep either copy.
+- If local and cloud workspaces differ, the app pauses syncing and lets the user choose a copy or merge safe records.
 - Trash is retained until restored or permanently deleted.
 - Account deletion removes the Google-linked user and workspace from MySQL.
 
